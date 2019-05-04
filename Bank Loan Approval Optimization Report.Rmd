@@ -1,0 +1,908 @@
+---
+title: "Bank Loan Approval Optimization Report"
+author: "Mark Riley"
+date: "April 23, 2019"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE, message=FALSE, warning=FALSE}
+library(dplyr) # For manipulating the data frame
+library(ggformula) # For graphing results
+library(mice) # For imputing missing values
+library(VIM) # For graphing missing values
+library(gridExtra) # For making grids of graphs
+library(scales) # For converting dollar and percent format
+
+# Go Eagles!
+laxMaroon = "#830019"
+laxGray = "#969799"
+
+# Load the dataset
+loans <- read.csv("loans50k.csv")
+```
+
+# Executive Summary  
+
+This report provides an analysis of our ability to predict which applicants are likely to default on their loans. Our selected method is logistic regression, which calculates the odds that a loan applicant will default. Each loan applicant is rated with odds between 0 (bad/default) and 1 (good/fully paid) using twenty five prediction variables such as loan amount, loan length, loan grade, income, and debt ratio. We then evaluated a number of odds threshold values to produce both the most accurate predicted results and to maximize the bank's profits, using a set of test data with known outcomes. A loan with a rating below the odds threshold classified the loan as a 'bad' loan, and a loan with a rating above or equal to the odds threshold classified the loan as 'good'.  
+
+Based on the data provided for this analysis, the bank's current level of accuracy is 78.1% of approved loans are fully paid, with a profit margin of 1.31%. When we optimized the accuracy of our model to predict loan status, we predicted that 80.7% of approved loans would be fully paid with a profit margin of 3.41%. When we optimized the model to produce the highest profit for the bank, we predicted that 84.1% of approved loans would be fully paid with a profit margin of 5.29%, a margin four times higher than the current loan approval methods.  
+
+Our recommendation is to deploy the model as designed in this project into production, with the threshold value optimal to maximizing the bank's profit.
+
+The model's overall accuracy level for maximum profit does leave opportunities for further improvement. The following steps could be pursued to see if they improve the model's ability to further increase the bank's profit margins.  
+
+* Use additional data points about loan applicants beyond what what used in this analysis.
+* This analysis only used data from loans that were approved. Conduct further analysis including details for loan applications that were denied.  
+
+# Introduction  
+The dataset includes 32 variables for 50,000 randomly selected loans. This project will use logistic regression to predict which applicants are likely to default on their loans. Our process for the analysis will include:  
+
+1. Prepare the response variable based on the values of the status variable.
+2. Remove observations from the dataset for loans that are late, current or in a grace period.
+3. Eliminate variables that are not useful to the analysis or are redundant with other variables.
+4. Consolidate categorical variables into meaningful groups.
+5. Analyze and deal with missing values in the dataset.
+6. Plot quantitative variables and transform heavily skewed results.
+7. Explore the relationships between predictors and loan status to look for significant predictors.
+8. Randomly divide the cleaned and transformed dataset into training (80% of observations) and testing (20% of observations).
+9. Create a logistic model from the training data using all predictor variables.
+10. Use the logistic model to predict the loan status for the test dataset with a threshold of 0.5.
+11. Optimize the threshold value for predictive accuracy.
+12. Optimize the threshold value for greatest net profit.  
+
+# Preparing and Cleaning the Data  
+## Response Variable  
+We will create a new response variable based on the existing status variable, loanStatus. The response variable will be a factor with two levels:  
+
+* Good -> loans with status of 'Fully Paid'
+* Bad - > loans with a status of 'Charged Off'  
+
+Additionally we will remove the loans with status of 'Late,' 'Current', or 'Grace Period' from the dataset.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+# Add a response variable. If the status is 'Fully Paid' set the 
+# response variable to 'Good' - if the status is 'Charged Off' set
+# the response variable to 'Bad' - otherwise set the status to NA
+loans <- 
+  loans %>% 
+  mutate(loanStatus = as.factor(case_when(
+   status == "Fully Paid" ~ "Good",
+   status == "Charged Off" ~ "Bad",
+   TRUE ~ NA_character_
+  )))
+
+# Remove loans that are late, current or in a grace period from the data
+loans <- 
+  loans %>% 
+  filter(is.na(loanStatus) == FALSE)
+
+# Graph the response variables
+loans %>% 
+  gf_bar(~ loanStatus, fill = laxMaroon) %>% 
+  gf_labs(title = "Loan Status",
+          y = "Counts",
+          x = "Loan Status")
+
+numLoans <- nrow(loans)
+goodLoans <- sum(loans$loanStatus == "Good")
+badLoans <- sum(loans$loanStatus == "Bad")
+
+print(paste("Count of 'Good' loans:", goodLoans, "and 'Bad' loans:", badLoans))
+print(paste("Proportion of 'Good' loans:", round((goodLoans/numLoans)*100, 1), 
+            "and 'Bad' loans", round((badLoans/numLoans)*100, 1)))
+```
+We can see the Good to Bad loan ratio is roughly 78/22 after creating the response variable and filtering out the unwanted observations.  
+
+## Eliminating Variables  
+Some variables will not be useful as predictors in our model. We reviewed the list of predictor variables in the dataset and determined the following variables could be removed:  
+
+* The 'employment' variable in the dataset has too many different values of varying quality to be grouped into meaningful categories, so we will drop that column from the dataset.
+* We will also drop the 'status' variable now that we have created a new response variable and filtered the observations based on those values.
+* The 'loanID' variable is a unique identifier for each loan and is not applicable to predicting if an applicant will default on their loan, so we will remove that variable as well.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.height=6, fig.width=10, fig.align="center"}
+# Plot the loan interest rate against the loan grade
+loans %>% 
+  gf_point(rate ~ grade, color = laxMaroon) %>% 
+  gf_labs(title = "Interest Rate vs. Grade of Loan",
+          subtitle = "Loan grade of 'A' is least risk, 'G' is most.",
+          y = "Interest Rate",
+          x = "Grade of Loan")
+```
+
+With a few exceptions, the 'rate' variable and the 'grade' variable have a strong positive linear correlation. Generally the most risk for the loan the higher the interest rate. We will remove the 'rate' variable from the dataset since that is a continuous variable.  
+
+## Quantitative Variable Correlation  
+Using the pair() function we performed analysis of all combinations of qualitative variables to assess the amount of correlation.  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+# Helper function for adding correlation coeficient values to a pairwise plot
+# (taken from pairs() help page).
+# As seen on: https://rpubs.com/mudassirkhan19/regression-model
+panel.cor <- function(x, y, digits = 2, prefix = "", cex.cor, ...) {
+    usr <- par("usr"); on.exit(par(usr))
+    par(usr = c(0, 1, 0, 1))
+    r <- abs(cor(x, y))
+    txt <- format(c(r, 0.123456789), digits = digits)[1]
+    txt <- paste0(prefix, txt)
+    if(missing(cex.cor)) cex.cor <- 0.8/strwidth(txt)
+    text(0.5, 0.5, txt, cex = cex.cor * r)
+}
+
+# Show the graphical and correlation coefficient between several of the significant variables
+pairs(~ amount + payment + totalBal + totalLim,
+      data = loans, 
+      lower.panel = panel.smooth, 
+      upper.panel = panel.cor, 
+      na.action = na.omit)
+```
+
+As we can see from the pair analysis the 'amount' and 'payment' variables have a strong positive correlation coefficient of 0.95. The 'totalBal' and 'totalLim' variables have a strong positive correlation coefficient of 0.99.
+
+* We will remove the 'payment' variable since it is computed between the loan amount, loan length (term), and interest rate.
+* We will also remove the 'totalLim' variable since it has very strong correlation to the 'totalBal' variable.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+dropCols <- c("employment", "status", "rate", "loanID", "payment", "totalLim")
+
+#Remove the variables from the dataset
+loans <- 
+  loans %>% 
+  select(-one_of(dropCols))
+```
+## Missing Values
+First we will check each variable in the dataset to see which variables have missing values.  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.height=8, fig.width=10, fig.align='center'}
+loans <- 
+  loans %>% 
+  mutate(
+    length = replace(length, length=="n/a", NA)
+  ) %>% 
+  mutate(
+    length = as.factor(length),
+    revolRatio = as.numeric(revolRatio),
+    bcOpen = as.numeric(bcOpen),
+    bcRatio = as.numeric(bcRatio)
+  )
+
+
+ap <- aggr(loans, col=c(laxGray, laxMaroon), numbers=TRUE, sortVars=TRUE, 
+                  labels=names(data), cex.axis=.7, gap=3, ylab=c("Histogram of missing data","Pattern"))
+```
+Only a few variables have NA values including length, revolRatio, bcOpen, and bcRatio.
+
+There is a 100% overlap between bcOpen missing values that have a corresponding bcRatio missing value. However there is not a strong correlation between missing bcOpen and bcRatio to other variables in the data set.
+
+Because the ratio of missing values is relatively low for each variable (<= 5%), we will use the mice package to impute the missing values. The imputed values will be added back into the dataset to assist with additional analysis.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+invisible(capture.output(imputed <- mice(loans, pred = quickpred(loans, method = "spearman"), seed = 255)))
+loans <- complete(imputed)
+```
+## Feature Engineering
+We will begin by consolidating the 'length' variable from 11 different non-NA values down to four levels:
+
+* <1 year
+* 1 - 4 years
+* 5 - 9 years
+* 10+ years  
+
+Some of the variables have values of 'n/a' and we will swap those for 'NA' in the dataset.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Replace the 'n/a' values with NA in the length variable
+# Replace 'Source Verified' with 'Verified' in the verified variable
+loans <- 
+  loans %>% 
+  mutate(length = replace(length, length=="n/a", NA),
+         verified = replace(verified, verified=="Source Verified", "Verified"))
+
+# Convert the large number of factors for length down to four values
+loans <- 
+  loans %>% 
+  mutate(length = as.factor(case_when(
+    length == "1 year" | length == "2 years" | length == "3 years" | length == "4 years"~ "1-4 years",
+    length == "5 years" | length == "6 years" | length == "7 years" | length == "8 years" | length == "9 years"~ "5-9 years",
+    TRUE ~ as.character(length)
+  )))
+
+summary(loans$length)
+```
+  
+The 'verified' variable has two values that are duplicates ('Source Verified' and 'Verified') to be consolidated into a single value of 'Verified'.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+summary(loans$verified)
+```
+  
+We have also summed up some of the smaller factors in the reason variable into the other factors as follows:
+
+* wedding -> vacation
+* renewable_energy -> other
+* home_improvement -> house  
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+loans <- 
+  loans %>% 
+  mutate(reason = as.factor(case_when(
+    reason == "wedding" ~ "vacation",
+    reason == "renewable_energy" ~ "other",
+    reason == "home_improvement" ~ "house",
+    TRUE ~ as.character(reason)
+  )))
+
+summary(loans$reason)
+```
+
+Finally we will group the states into regions using the following alignment:
+
+* New England: (CT, ME, MA, NH, RI, VT)
+* Mid-Atlantic: (NJ, NY, PA)
+* East North Central (IL, IN, MI, OH, WI)
+* West North Central (IA, KS, MN, MO, NE, ND, SD)
+* South Atlantic (DE, FL, GA, MD, NC, SC, VA, DC, WV)
+* East South Central (AL, KY, MS, TN)
+* West South Central (AR, LA, OK, TX)
+* Mountain (AZ, CO, ID, MT, NV, NM, UT, WY)
+* Pacific (AK, CA, HI, OR, WA)
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+loans <- 
+  loans %>% 
+  mutate(state = as.factor(case_when(
+    state == "CT" | state == "ME" | state == "MA" | state == "NH" | state == "RI" | state == "VT" ~ "New England",
+    state == "NJ" | state == "NY" | state == "PA" ~ "Mid-Atlantic",
+    state == "IL" | state == "IN" | state == "MI" | state == "OH" | state == "WI" ~ "East North Central",
+    state == "IA" | state == "KS" | state == "MN" | state == "MO" | state =="NE" | 
+      state == "ND" | state == "SD" ~ "West North Central",
+    state == "DE" | state == "FL" | state == "GA" | state == "MD" | state == "NC" | 
+      state == "SC" | state == "VA" | state == "DC" | state == "WV" ~ "South Atlantic",
+    state == "AL" | state == "KY" | state == "MS" | state == "TN" ~ "East South Central",
+    state == "AR" | state == "LA" | state == "OK" | state == "TX" ~ "West South Central",
+    state == "AZ" | state == "CO" | state == "ID" | state == "MT" | state == "NV" | 
+      state == "NM" | state == "UT" | state == "WY" ~ "Mountain",
+    state == "AK" | state == "CA" | state == "HI" | state == "OR" | state == "WA" ~ "Pacific"
+  )))
+
+summary(loans$state)
+```
+
+# Exploring and Transforming the Data
+We will now examine the distributions of the quantitative predictor variables. If there is a strong skew we will attempt transformations such a reciprocals, logarithms, cube roots, and square roots to un-skew the data and replace that predictor variable in the dataset with the transformed value.  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+loans %>% 
+  gf_histogram(~ amount, fill = laxMaroon) %>% 
+  gf_labs(title = "Loan Amount Density")
+
+```
+
+The 'amount' variable is only slightly right-skewed so we will not transform its values.  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+g <- loans %>% 
+  gf_histogram(~ income, fill = laxMaroon) %>% 
+  gf_labs(title = "Income")
+
+g0 <- loans %>% 
+  gf_histogram(~ log10(income), fill = laxMaroon) %>% 
+  gf_labs(title = "Income (Log10)")
+
+grid.arrange(g, g0, ncol = 2)
+```
+
+We can see from the density plot that 'income' has a strong right skew. Taking the logarithm base 10 of the 'income' produces a normally distributed density plot. We will replace the income value in the data set with the transformed value.
+
+Below are some samples of the skewed and transformed distribution graphs for the remaining quantitative predictor variables.  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+# Replace 
+loans <- 
+  loans %>% 
+  mutate(income = log10(income))
+
+# totalRevBal
+g1 <- loans %>% 
+  gf_histogram(~ totalRevBal, fill = laxMaroon) %>% 
+  gf_labs(title = "Total Credit Balance Except Mortgages")
+
+g2 <- loans %>% 
+  gf_histogram(~ totalRevBal^(1/3), fill = laxMaroon) %>% 
+  gf_labs(title = "Total Credit Balance Except Mortgages (Cube Root)")
+
+grid.arrange(g1, g2, ncol = 2)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+loans <- 
+  loans %>% 
+  mutate(totalRevBal = totalRevBal^(1/3))
+
+# totalBcLim
+g3 <- loans %>% 
+  gf_histogram(~ totalBcLim, fill = laxMaroon) %>% 
+  gf_labs(title = "Total Credit Limits of Credit Cards")
+
+g4 <- loans %>% 
+  gf_histogram(~ log10(totalBcLim + 1), fill = laxMaroon) %>% 
+  gf_labs(title = "Total Credit Limits of Credit Cards (Log10)")
+
+grid.arrange(g3, g4, ncol = 2)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+loans <- 
+  loans %>% 
+  mutate(totalBcLim = log10(totalBcLim + 1))
+
+# totalIlLim
+g5 <- loans %>% 
+  gf_histogram(~ totalIlLim, fill = laxMaroon) %>% 
+  gf_labs(title = "Total Credit Limits for Installment Accounts")
+
+g6 <- loans %>% 
+  gf_histogram(~ log10(totalIlLim + 1), fill = laxMaroon) %>% 
+  gf_labs(title = "Total Credit Limits for Installment Accounts (Log10)")
+
+grid.arrange(g5, g6, ncol = 2)
+
+loans <- 
+  loans %>% 
+  mutate(totalIlLim = log10(totalIlLim + 1))
+```
+
+
+```{r eval=FALSE, echo=FALSE, warning=FALSE, message=FALSE}
+# openAcc
+g7 <- loans %>% 
+  gf_histogram(~ openAcc, fill = laxMaroon) %>% 
+  gf_labs(title = "Num. of Open\nCredit Lines")
+
+g8 <- loans %>% 
+  gf_histogram(~ log10(openAcc), fill = laxMaroon) %>% 
+  gf_labs(title = "Num. of Open Credit\nLines (Log10)")
+
+grid.arrange(g7, g8)
+
+loans <- 
+  loans %>% 
+  mutate(openAcc = log10(openAcc))
+
+# totalAcc
+g9 <- loans %>% 
+  gf_histogram(~ totalAcc, fill = laxMaroon) %>% 
+  gf_labs(title = "Total Num. of Credit\nLines (Open & Closed)")
+
+g10 <- loans %>% 
+  gf_histogram(~ log10(totalAcc), fill = laxMaroon) %>% 
+  gf_labs(title = "Total Num. of Credit\nLines in File (Open & Closed - Log10)")
+
+grid.arrange(g9, g10)
+
+loans <- 
+  loans %>% 
+  mutate(totalAcc = log10(totalAcc))
+
+# totalBal
+g11 <- loans %>% 
+  gf_histogram(~ totalBal, fill = laxMaroon) %>% 
+  gf_labs(title = "Total Current Balance\nof All Credit Accts")
+ 
+g12 <- loans %>% 
+  gf_histogram(~ log10(totalBal), fill = laxMaroon) %>% 
+  gf_labs(title = "Total Current Balance\nof All Credit Accts (Log10)")
+
+grid.arrange(g11, g12)
+
+loans <- 
+  loans %>% 
+  mutate(totalBal = log10(totalBal))
+
+# totalRevLim
+g13 <- loans %>% 
+  gf_histogram(~ totalRevLim, fill = laxMaroon) %>% 
+  gf_labs(title = "Sum of Credit Limits\nfor All Credit Lines")
+
+g14 <- loans %>% 
+  gf_histogram(~ log10(totalRevLim), fill = laxMaroon) %>% 
+  gf_labs(title = "Sum of Credit Limits\nfor All Credit Lines (Log10)")
+
+grid.arrange(g13, g14)
+
+loans <- 
+  loans %>% 
+  mutate(totalRevLim = log10(totalRevLim))
+
+# avgBal
+g15 <- loans %>% 
+  gf_histogram(~ avgBal, fill = laxMaroon) %>% 
+  gf_labs(title = "Avg. Balance per Account")
+
+g16 <- loans %>% 
+  gf_histogram(~ log10(avgBal), fill = laxMaroon) %>% 
+  gf_labs(title = "Avg. Balance per\nAccount (Log10)")
+
+grid.arrange(g15, g16)
+
+loans <- 
+  loans %>% 
+  mutate(avgBal = log10(avgBal))
+
+# bcOpen
+g17 <- loans %>% 
+  gf_histogram(~ bcOpen, fill = laxMaroon) %>% 
+  gf_labs(title = "Total Unused Credit\non Credit Cards")
+
+g18 <- loans %>% 
+  gf_histogram(~ log10(bcOpen), fill = laxMaroon) %>% 
+  gf_labs(title = "Total Unused Credit\non Credit Cards (Log10)")
+
+grid.arrange(g17, g18)
+
+loans <- 
+  loans %>% 
+  mutate(bcOpen = log10(bcOpen))
+
+```
+
+```{r eval=FALSE, echo=FALSE, warning=FALSE, message=FALSE}
+
+# These quantitative variables are either relatively normally distributed
+# or not responsive to common transformations
+loans %>% 
+  gf_histogram(~ debtIncRat, fill = laxMaroon) %>% 
+  gf_labs(title = "Debt to Income Ratio")
+
+loans %>% 
+  gf_histogram(~ delinq2yr, fill = laxMaroon) %>% 
+  gf_labs(title = "Number of 30+ Day Late Payments (Last Two Years)")
+
+loans %>% 
+  gf_histogram(~ inq6mth, fill = laxMaroon) %>% 
+  gf_labs(title = "Number of Credit Checks (Last Six Months)")
+
+loans %>% 
+  gf_histogram(~ pubRec, fill = laxMaroon) %>% 
+  gf_labs(title = "Number of Derogatory Public Records")
+
+loans %>% 
+  gf_histogram(~ revolRatio, fill = laxMaroon) %>% 
+  gf_labs(title = "Portion of Revolving Credit in Use")
+
+loans %>% 
+  gf_histogram(~ accOpen24, fill = laxMaroon) %>% 
+  gf_labs(title = "Number of Accounts Opened (Last 2 Years)")
+
+loans %>% 
+  gf_histogram(~ bcRatio, fill = laxMaroon) %>% 
+  gf_labs(title = "Ratio of Total Credit Card Balance to Total Credit Card Limits")
+
+```
+## Data Exploration  
+In this section we will make graphs to explore the relationships between the predictors and loan status.  
+
+### Quantitative Predictors vs. Loan Status  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+
+q1 <- loans %>% 
+  gf_boxplot(amount ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Loan Amount ($)",
+    x = "Loan Status"
+  )
+
+q2 <- loans %>% 
+  gf_boxplot(debtIncRat ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Ratio Monthly Non-Mort. Debt Pmt To Monthly Income",
+    x = "Loan Status"
+  )
+
+grid.arrange(q1, q2, ncol = 2)
+
+q3 <- loans %>% 
+  gf_boxplot(revolRatio ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Proportion Of Revoling Credit In Use",
+    x = "Loan Status"
+  )
+
+q4 <- loans %>% 
+  gf_boxplot(bcRatio ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Ratio Of Total CC Bal. To Total CC Limits",
+    x = "Loan Status"
+  )
+
+grid.arrange(q3, q4, ncol = 2)
+```
+
+```{r eval=FALSE, echo=FALSE, warning=FALSE, message=FALSE}
+loans %>% 
+  gf_boxplot(income ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Annual Income In Dollars",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(delinq2yr ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Number Of 30+ Day Late Payments\nIn Last Two Years",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(inq6mth ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Number Of Credit Checks\nIn The Past 6 Months",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(openAcc ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Number Of Open Credit Lines",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(pubRec ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Number Of Derogatory Public Records Including\nBankruptcy Filings, Tax Liens, Etc.",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(totalAcc ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Total Number Of Credit Lines In File,\nIncludes Both Open And Closed Accounts",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(totalBal ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Total Current Balance Of All Credit Accounts",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(totalRevLim ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Sum Of Credit Limits From All Credit Lines",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(accOpen24 ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "How Many Accounts Were Opened In The Past 24 Months",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(avgBal ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Average Balance Per Account",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(bcOpen ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Total Unused Credit On Credit Cards",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(totalRevBal ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Total Credit Balance Except Mortgages",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(totalBcLim ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Total Credit Limits Of Credit Cards",
+    x = "Loan Status"
+  )
+
+loans %>% 
+  gf_boxplot(totalIlLim ~ loanStatus, color = laxMaroon) %>% 
+  gf_labs(
+    title = "Total Of Credit Limits For\nInstallment Accounts",
+    x = "Loan Status"
+  )
+
+```
+We plotted all of the quantitative predictors against the loan status. Above is a sample of the graphical analysis of the quantitative predictors. The boxplot graphs do not show any particularly strong relationships to the loanStatus variable.  
+
+### Categorical Predictors  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=8, fig.width=10, fig.align='center'}
+
+c1 <- loans %>% 
+  gf_bar(~ term, fill = ~ loanStatus, position = position_dodge()) %>% 
+  gf_refine(scale_fill_manual(values = c(laxGray, laxMaroon))) %>% 
+  gf_labs(title = "Loan Terms by Loan Status",
+          x = "Loan Term",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+c2 <- loans %>% 
+  gf_bar(~ grade, fill = ~ loanStatus, position = position_dodge()) %>% 
+  gf_refine(scale_fill_manual(values = c(laxGray, laxMaroon))) %>% 
+  gf_labs(title = "Loan Grade by Loan Status",
+          x = "Loan Grade",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+grid.arrange(c1, c2, nrow = 2)
+```
+
+```{r eval=FALSE, echo=FALSE, warning=FALSE, message=FALSE}
+
+loans %>% 
+  gf_bar(~ reason, fill =~ loanStatus, position = position_dodge()) %>% 
+  gf_refine(scale_color_manual(values = c(laxGray, laxMaroon))) %>% 
+  gf_theme(axis.text.x = element_text(angle = 90, hjust = 1)) %>% 
+  gf_labs(title = "Loan Purpose by Loan Status",
+          x = "Loan Purpose",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+loans %>% 
+  gf_bar(~ length, fill =~ loanStatus, position = position_dodge()) %>% 
+  gf_refine(scale_color_manual(values = c(laxGray, laxMaroon))) %>% 
+  gf_labs(title = "Employment Length by Loan Status",
+          x = "Employment Length",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+loans %>% 
+  gf_bar(~ home, fill =~ loanStatus, position = position_dodge()) %>% 
+  gf_refine(scale_color_manual(values = c(laxGray, laxMaroon))) %>% 
+  gf_labs(title = "Home Ownership by Loan Status",
+          x = "Home Ownership",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+loans %>% 
+  gf_bar(~ verified, fill =~ loanStatus, position = position_dodge()) %>% 
+  gf_refine(scale_color_manual(values = c(laxGray, laxMaroon))) %>% 
+  gf_labs(title = "Income Verification by Loan Status",
+          x = "Income Verification",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+loans %>% 
+  gf_bar(~ state, fill =~ loanStatus, position = position_dodge()) %>% 
+  gf_theme(axis.text.x = element_text(angle = 90, hjust = 1)) %>% 
+  gf_labs(title = "Applicant Region\nby Loan Status",
+          x = "Applicant Region",
+          y = "Number of Loans",
+          color = "Loan Status")
+
+```
+We plotted all of the categorical predictors against the loanStatus response variable. Above is a sampling of the interesting results. A loan term of 60 months seems to have a much higher proportion of 'Bad' loans than loans with a 36 month term.  The loan grade also seems to have a higher proportion of 'Bad' loans as the level of risk rises, with a grade of 'G' appearing to have more 'Bad' loans than 'Good'.  
+
+# The Logistic Model  
+The target response variable for the prediction model is an indicator of whether a loan will be 'Good' (i.e. paid in full) or 'Bad' (i.e. charged off or defaulted). We took the following steps to create the logistic model on the cleaned and transformed data:
+
+1. Randomly select 80% of the records for a training dataset and the remaining 20% for a testing dataset.
+2. Using all of the predictor variables, except for totalPaid, we ran a logistic regression using the training dataset.
+3. Using the the model from step 2, we predicted the loan status for loans in the testing dataset.
+4. We created a contingency table to determine the overall accuracy of the logistic model on the testing dataset, using a threshold of 0.5.  
+
+## Logistic Model Results  
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+# Split the dataset into training (80%) and testing (20%)
+smpl_sz <-floor(0.8 * nrow(loans))
+set.seed(255)
+train_ind <- sample(seq_len(nrow(loans)), size = smpl_sz)
+train <- loans[train_ind, ]
+test <- loans[-train_ind, ]
+
+# Create logistic model (full) using training data
+fullglm <- glm(loanStatus ~ amount + term + grade + length + home + income + verified + reason + state + debtIncRat +
+                 delinq2yr + inq6mth + openAcc + pubRec + revolRatio + totalAcc + totalBal + totalRevLim + accOpen24 +
+                 avgBal + bcOpen + bcRatio + totalRevBal + totalBcLim + totalIlLim, data = train, family = "binomial")
+
+# Predict loan status from the testing dataset using the logistic model
+fullPredict <- predict(fullglm, newdata = test, type = "response")
+
+threshhold <- 0.5  # Set Y=1 when predicted probability exceeds this
+
+predGood <- cut(fullPredict, breaks=c(-Inf, threshhold, Inf), 
+                labels=c("Bad Loan", "Good Loan"))  # Y=1 is "Good Loan" here
+
+cTab <- table(test$loanStatus, predGood) 
+addmargins(cTab)
+
+p <- sum(diag(cTab)) / sum(cTab)  # compute the proportion of correct classifications
+print(paste('Proportion correctly predicted =', round(p, 3)))
+
+```
+
+The logistic model correctly classified 79.4% of the loan statuses in the testing dataset. This is a relatively good model for predicting loan status. The full dataset proportion of good loans was 78.1%. If we assume that the bank approves loans to all of the applicants who receive a prediction of Good from this model (6,566 loans), 80.7% percent of those loans (5,296) would be repaid in full. This model outperforms existing predictive measures.  
+
+# Optimizing the Threshold for Accuracy  
+The analysis above uses a threshold value of 0.5. To test if there is a better threshold for predicting bad loans we wrote a procedure to loop through threshold values from 0.001 to 1.000 and check the accuracy at each threshold level.  
+
+## Threshold Optimization Results  
+```{r echo=FALSE, warning=FALSE, message=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+
+test_accuracy <- function(m_test, m_pred, th) {
+  # This function calculates the accuracy of our logistic model
+  # based on the testing data.
+  
+  # Split the model predictions based on the threshold
+  pred <- cut(m_pred, breaks=c(-Inf, th, Inf), 
+                labels=c("Bad Loan", "Good Loan"))  # Y=1 is "Good Loan" here
+
+  # Create a table to calculate the accuracy based on the threshold
+  cTab <- table(m_test, pred)
+  
+  # Add row and column totals
+  addmargins(cTab)
+  
+  # compute the proportion of correct classifications
+  p <- sum(diag(cTab)) / sum(cTab)
+  
+  # Return the proportion of correct loan predictions
+  return(p)
+}
+
+th_loop <- function(x) {
+  # This function calculates the model accuracy by looping x number
+  # of times and passing different threshold values to the test_accuracy
+  # function.
+  
+  acc <- 0 # Holds the result of each test_accuracy call
+  th <- 0 # Initial threshold value
+  
+  # Create a matrix to hold the results of the looping
+  toReturn <- matrix(nrow = x, ncol = 2)
+  
+  # Set the names of the columns for the results
+  colnames(toReturn) = c("Threshold", "Accuracy")
+  
+  for(i in 1:x) { # Loop x number of times as defined by the arguments
+    
+    # Calculate the threshold value by dividing the loop index
+    # by the total number of loops
+    th <- i/x
+    
+    # Call the test_accuracy function passing the loanStatus from
+    # the test dataset, the prediction model, and the
+    # calculated threshold
+    acc <- test_accuracy(test$loanStatus, fullPredict, th)
+    
+    # Add the current threshold and accuracy calculation
+    # to the result matrix
+    toReturn[i, 1] = th
+    toReturn[i, 2] = acc
+    
+  } # end for
+  
+  # Return the result matrix
+  return(toReturn)
+}
+
+# Calculate the best accuracy 
+best_th <- th_loop(1000)
+
+# Determine which threshold had the best accuracy level
+max_acc <- best_th[best_th[, "Accuracy"] == max(best_th[, "Accuracy"])]
+
+# Graph the results
+gf_point(best_th[,2] ~ best_th[,1], stat = "identity", color = laxMaroon) %>% 
+  gf_labs(
+    title = "Accuracy vs. Threshold",
+    subtitle = "Maximizing Accuracy",
+    y = "Accuracy",
+    x = "Threshold"
+  )
+
+# Display the results
+print(paste("The threshold value that produces the best accuracy is", round(max_acc[1], 3), 
+            "with an accuracy of", percent(max_acc[2])))
+
+
+```
+After testing 1,000 different threshold values we are unable to get a better result than the threshold value of 0.5 with an overall accuracy of 0.794. At that threshold level the accuracy for 'Good' loans is 80.7% (5296/6566) and the accuracy for 'Bad' loans is 55.9% (204/365).  
+
+# Optimizing the Threshold for Profit  
+We will now test to see if there is a threshold value of that produces a better level of profitability for the bank. For each loan predicted as 'Good' we will calculate the profit as totalPaid - amount.  
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+test %>% 
+  group_by(loanStatus) %>% 
+  summarise(profit = dollar(sum(totalPaid - amount), negative_parens = TRUE))
+```
+The current level of profitability for 'Good' loans is \$12,715,887 from the test dataset, but including losses from 'Bad' loans the net profitability is \$1,663,165. Again we will loop through threshold values from 0.001 to 1.000 to determine the threshold value that results in the greatest level of profitability for the bank.  
+
+```{r warning=FALSE, message=FALSE, echo=FALSE, fig.height=6, fig.width=10, fig.align='center'}
+# Bind the prediction results to the test dataset
+test <- cbind(test, fullPredict)
+
+test_profit <- function(m_test, x) {
+  # This function calculates x number of profit results based on
+  # different threshold values and returns a matrix of results
+  
+  # Create a matrix to store the results
+  toReturn <- matrix(nrow = x, ncol = 2)
+  
+  # Name the matrix columns
+  colnames(toReturn) <- c("Threshold", "Profit")
+  
+  for(i in 1:x) { # Loop x number of times
+    th = i/x # Set the threshold to the current iteration divided by the total iterations
+    
+    # Calculate the profitability of this threshold by filtering for loans
+    # with a predicted value greater or equal to the threshold value
+    z <- m_test %>% 
+      filter(fullPredict >= th) %>% 
+      summarise(profit = sum(totalPaid - amount))
+    
+    # Add the threshold value and profit to the result matrix
+    toReturn[i, 1] <- th
+    toReturn[i, 2] <- z[1, 1]
+  }
+  
+  # Return the result
+  return(toReturn)
+  
+}
+
+# Calculate the proft results based on different threshold levels
+best_profit <- test_profit(test, 1000)
+
+# Get the threshold value that resulted in the highest profit
+max_profit <- best_profit[best_profit[ , "Profit" ] == max(best_profit[, "Profit"])]
+
+# Graph the result - converting profit to thousands of dollars for better readability 
+gf_point(best_profit[, "Profit"]/1000 ~ best_profit[, "Threshold"], color = laxMaroon) %>% 
+  gf_labs(
+    title = "Profit vs Threshold",
+    subtitle = "Maximizing Profit",
+    y = "Profit (in $1,000s)",
+    x = "Threshold"
+  )
+
+# Display the result
+print(paste("The threshold with the highest loan profit is", max_profit[1],"with a total profit of", dollar(max_profit[2])))
+```
+The maximum percentage increase in profit by using this model with a threshold value of 0.658 is 149% over the current method for approving or denying loans. Compared to the profit level, $12,715,887, from a perfect model (approve all 'Good' loans and deny all 'Bad' loans), this model is only 33% of the perfect level of profitability using the test dataset.  
+
+```{r warning=FALSE, message=FALSE, echo=FALSE}
+acc_profit <- best_th[best_th[, "Threshold"] == max_profit[1]] 
+print(paste("The overall accuracy of the threshold for highest profit is", percent(acc_profit[2])))
+
+th <- max_profit[1]
+
+# Split the model predictions based on the threshold
+pred <- cut(fullPredict, breaks=c(-Inf, th, Inf), labels=c("Bad Loan", "Good Loan"))  # Y=1 is "Good Loan" here
+
+# Create a table to calculate the accuracy based on the threshold
+cTab <- table(test$loanStatus, pred) 
+
+# Add row and column totals
+addmargins(cTab)
+```
+
+The maximum profit threshold (0.658) does not coincide with the maximum accuracy threshold (0.500).  
+
+# Results Summary  
+Our recommendation is to use the model as designed in this project, using a threshold level of 0.658 to maximize the bank's profit. The overall accuracy of the model at this threshold is 76.4%, accuracy for 'Good' loans is 84.1%, and accuracy for 'Bad' loans is 43.9%. The profitability at this threshold is $4,133,014, representing a 149% increase over the current method for approving loans.
+
+## Model Limitations
+The model's overall accuracy level for maximum profit is 76.4% leaves opportunity for further improvement. The following steps could be pursued to see if they improve the model's accuracy.  
+
+* Use additional predictor variables to determine if they have significant predictive value
+* Include observations on loan applications that were denied along with the existing dataset of approved loan applications
